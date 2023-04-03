@@ -3,6 +3,7 @@
 #cython: nonecheck=False
 #cython: wraparound=False
 from libc.float cimport DBL_MAX
+from libc.math cimport sqrt
 
 import numpy as np
 cimport numpy as cnp
@@ -19,9 +20,12 @@ def _slic_cython(np_floats[:, :, :, ::1] image_zyx,
                  cnp.float32_t step,
                  Py_ssize_t max_num_iter,
                  np_floats[::1] spacing,
+                 np_floats[:, :, ::1] feature_map,
+                 np_floats feature_weight,
+                 np_floats compactness,
                  bint slic_zero,
-                 Py_ssize_t start_label=1,
-                 bint ignore_color=False):
+                 Py_ssize_t start_label,
+                 bint ignore_color):
     """Helper function for SLIC segmentation.
 
     Parameters
@@ -40,6 +44,10 @@ def _slic_cython(np_floats[:, :, :, ::1] image_zyx,
         The voxel spacing along each image dimension. This parameter
         controls the weights of the distances along z, y, and x during
         k-means clustering.
+    feature_map : 3D array of np_floats, shape (Y, X, F)
+        A array containg learned features for every pixel
+    weights : 1D array of three np_floats
+        A array containg the weights for each distance in order spatial, color, feature
     slic_zero : bool
         True to run SLIC-zero, False to run original SLIC.
     start_label: int
@@ -47,6 +55,12 @@ def _slic_cython(np_floats[:, :, :, ::1] image_zyx,
     ignore_color : bool
         True to update centroid positions without considering pixels
         color.
+    ignore_spatial : bool
+        True to update centroid positions without considering pixels
+        position.
+    ignore_feature : bool
+        True to update centroid positions without considering feature
+        distance.
 
     Returns
     -------
@@ -90,6 +104,8 @@ def _slic_cython(np_floats[:, :, :, ::1] image_zyx,
     cdef Py_ssize_t n_segments = segments.shape[0]
     # number of features [X, Y, Z, ...]
     cdef Py_ssize_t n_features = segments.shape[1]
+    cdef bint is_grayscale = n_features % 4 == 0
+    cdef Py_ssize_t f_offset = 4 if is_grayscale else 6
 
     # approximate grid size for desired n_segments
     cdef Py_ssize_t step_z, step_y, step_x
@@ -107,9 +123,9 @@ def _slic_cython(np_floats[:, :, :, ::1] image_zyx,
         = np.empty((depth, height, width), dtype=dtype)
     cdef Py_ssize_t[::1] n_segment_elems = np.empty(n_segments, dtype=np.intp)
 
-    cdef Py_ssize_t i, c, k, x, y, z, x_min, x_max, y_min, y_max, z_min, z_max
+    cdef Py_ssize_t i, j, c, k, x, y, z, x_min, x_max, y_min, y_max, z_min, z_max
     cdef bint change
-    cdef np_floats dist_center, cx, cy, cz, dx, dy, dz, t
+    cdef np_floats dist, sptl_dist, clr_dist, ftr_dist, cx, cy, cz, dx, dy, dz, t, A_mag, B_mag, AB
 
     cdef np_floats sz, sy, sx
     sz = spacing[0]
@@ -119,10 +135,9 @@ def _slic_cython(np_floats[:, :, :, ::1] image_zyx,
     # The colors are scaled before being passed to _slic_cython so
     # max_color_sq can be initialised as all ones
     cdef np_floats[::1] max_dist_color = np.ones(n_segments, dtype=dtype)
-    cdef np_floats dist_color
 
     # The reference implementation (Achanta et al.) calls this invxywt
-    cdef np_floats spatial_weight = 1.0 / (step * step)
+    cdef np_floats spatial_weight = (compactness * compactness) / (step * step)
 
     with nogil:
         for i in range(max_num_iter):
@@ -158,22 +173,37 @@ def _slic_cython(np_floats[:, :, :, ::1] image_zyx,
 
                             dx = sx * (cx - x)
                             dx *= dx
-                            dist_center = (dz + dy + dx) * spatial_weight
 
+                            if compactness > 0:
+                                sptl_dist = (dz + dy + dx) * spatial_weight
+
+                            clr_dist = 0
                             if not ignore_color:
-                                dist_color = 0
-                                for c in range(3, n_features):
+                                for c in range(3, f_offset):
                                     t = (image_zyx[z, y, x, c - 3]
                                          - segments[k, c])
-                                    dist_color += t * t
+                                    clr_dist += t * t
 
                                 if slic_zero:
-                                    dist_color /= max_dist_color[k]
-                                dist_center += dist_color
+                                    clr_dist /= max_dist_color[k]
+                                
 
-                            if distance[z, y, x] > dist_center:
+                           # calculate feature distance
+                            if feature_weight > 0:
+                                A_mag = 0
+                                B_mag = 0
+                                AB = 0
+                                for j in range(128):
+                                    A_mag += feature_map[y, x, j] * feature_map[y, x, j]
+                                    B_mag += segments[k, f_offset + j] * segments[k, f_offset + j]
+                                    AB += feature_map[y, x, j] * segments[k, f_offset + j]
+                                ftr_dist = (1 - AB / sqrt(A_mag * B_mag)) * feature_weight * feature_weight
+                            
+                            dist = sptl_dist + clr_dist + ftr_dist 
+
+                            if distance[z, y, x] > dist:
                                 nearest_segments[z, y, x] = k + start_label
-                                distance[z, y, x] = dist_center
+                                distance[z, y, x] = dist
                                 change = True
 
             # stop if no pixel changed its segment
@@ -197,12 +227,20 @@ def _slic_cython(np_floats[:, :, :, ::1] image_zyx,
                                 continue
 
                         k = nearest_segments[z, y, x] - start_label
-                        n_segment_elems[k] += 1
-                        segments[k, 0] += z
-                        segments[k, 1] += y
-                        segments[k, 2] += x
-                        for c in range(3, n_features):
-                            segments[k, c] += image_zyx[z, y, x, c - 3]
+
+                        if compactness > 0:
+                            n_segment_elems[k] += 1
+                            segments[k, 0] += z
+                            segments[k, 1] += y
+                            segments[k, 2] += x
+
+                        if not ignore_color:
+                            for i in range(3, f_offset):
+                                segments[k, i] += image_zyx[z, y, x, i - 3]
+
+                        if feature_weight > 0:
+                            for i in range(128):
+                                segments[k, f_offset + i] += feature_map[y, x, i]
 
             # divide by number of elements per segment to obtain mean
             for k in range(n_segments):
@@ -223,16 +261,16 @@ def _slic_cython(np_floats[:, :, :, ::1] image_zyx,
                                     continue
 
                             k = nearest_segments[z, y, x] - start_label
-                            dist_color = 0
+                            clr_dist = 0
 
-                            for c in range(3, n_features):
+                            for c in range(3, f_offset):
                                 t = image_zyx[z, y, x, c - 3] - segments[k, c]
-                                dist_color += t * t
+                                clr_dist += t * t
 
                             # The reference implementation seems to only change
                             # the color if it increases from previous iteration
-                            if max_dist_color[k] < dist_color:
-                                max_dist_color[k] = dist_color
+                            if max_dist_color[k] < clr_dist:
+                                max_dist_color[k] = clr_dist
 
     return np.asarray(nearest_segments)
 

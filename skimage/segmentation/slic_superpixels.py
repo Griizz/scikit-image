@@ -109,11 +109,11 @@ def _get_grid_centroids(image, n_centroids):
 
 
 @utils.channel_as_last_axis(multichannel_output=False)
-def slic(image, n_segments=100, compactness=10., max_num_iter=10, sigma=0,
+def slic(image, feature_map=None, n_segments=100, compactness=10., max_num_iter=10, sigma=0,
          spacing=None, convert2lab=None,
          enforce_connectivity=True, min_size_factor=0.5, max_size_factor=3,
-         slic_zero=False, start_label=1, mask=None, *,
-         channel_axis=-1):
+         slic_zero=False, start_label=1, mask=None, *, channel_axis=-1,
+         feature_weight=1.0, ignore_color=False):
     """Segments image using k-means clustering in Color-(x,y,z) space.
 
     Parameters
@@ -122,6 +122,8 @@ def slic(image, n_segments=100, compactness=10., max_num_iter=10, sigma=0,
         Input image, which can be 2D or 3D, and grayscale or multichannel
         (see `channel_axis` parameter).
         Input image must either be NaN-free or the NaN's must be masked out
+    feature_map : 3D ndarray, optional
+        A Feature map containing learnd features for the image. Does not support multi channel images.
     n_segments : int, optional
         The (approximate) number of labels in the segmented output image.
     compactness : float, optional
@@ -183,6 +185,15 @@ def slic(image, n_segments=100, compactness=10., max_num_iter=10, sigma=0,
 
         .. versionadded:: 0.19
            ``channel_axis`` was added in 0.19.
+
+    feature_weight : float, optional
+        The weight for the feature distance. Default is 1 or 0
+
+    ignore_color : bool
+        True to update centroid positions without considering pixels
+        color.
+
+
 
     Returns
     -------
@@ -308,6 +319,28 @@ def slic(image, n_segments=100, compactness=10., max_num_iter=10, sigma=0,
         elif image.shape[channel_axis] == 3:
             image = rgb2lab(image)
 
+    image_y = image.shape[1]
+    image_x = image.shape[2]
+
+    # Validate Feature Map
+    if feature_map is None:
+        feature_weight = 0.0
+        feature_map = np.ones((image_y, image_x, 0), dtype)
+
+    if len(feature_map.shape) != 3:
+        raise ValueError("feature map should be 3-dimensional.")
+
+    if (feature_map.shape[0] != image_y or feature_map.shape[1] != image_x):
+        raise ValueError(
+            "feature_map needs to have the same dimensions as image.")
+
+    feature_map = feature_map.astype(dtype)
+
+    # Validate feature weight
+    if not isinstance(feature_weight, float):
+        raise ValueError("Feature weight should be a float")
+
+    # Validate Start Lable
     if start_label not in [0, 1]:
         raise ValueError("start_label should be 0 or 1.")
 
@@ -372,26 +405,29 @@ def slic(image, n_segments=100, compactness=10., max_num_iter=10, sigma=0,
         image = gaussian(image, sigma, mode='reflect')
 
     n_centroids = centroids.shape[0]
-    segments = np.ascontiguousarray(np.concatenate(
-        [centroids, np.zeros((n_centroids, image.shape[3]))],
-        axis=-1), dtype=dtype)
+    segments = np.ascontiguousarray(
+        np.concatenate([
+            centroids,
+            np.zeros((n_centroids, image.shape[3])),
+            np.ones((n_centroids, feature_map.shape[2]))
+        ], axis=-1),
+        dtype=dtype)
 
     # Scaling of ratio in the same way as in the SLIC paper so the
     # values have the same meaning
     step = max(steps)
-    ratio = 1.0 / compactness
 
-    image = np.ascontiguousarray(image * ratio, dtype=dtype)
+    image = np.ascontiguousarray(image, dtype=dtype)
+    feature_map = np.ascontiguousarray(feature_map, dtype=dtype)
 
     if update_centroids:
         # Step 2 of the algorithm [3]_
         _slic_cython(image, mask, segments, step, max_num_iter, spacing,
-                     slic_zero, ignore_color=True,
-                     start_label=start_label)
+                     feature_map, 0.0, 1.0, False, 1, True)
 
     labels = _slic_cython(image, mask, segments, step, max_num_iter,
-                          spacing, slic_zero, ignore_color=False,
-                          start_label=start_label)
+                          spacing, feature_map, feature_weight, compactness,
+                          slic_zero, start_label, ignore_color)
 
     if enforce_connectivity:
         if use_mask:
